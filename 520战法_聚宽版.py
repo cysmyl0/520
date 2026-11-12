@@ -17,10 +17,10 @@
     R1 MA5>MA20                decide_at_1455() 的 ma5_t > ma20_t
     R2 存在回踩段 + 不破20线    _scan_structure() 的 S 与两条作废判断
     R3 温和带量                _buy_scan() 的 vol >= TOL*VMA5 且 >= TOL*VMA10
-    R4 收盘>MA5                _buy_scan() 的 price > ma5_t
+    R4 收盘>MA5×1.01           _buy_scan() 的 price > ma5_t * BUF
     R5 非巨量                  _buy_scan() 的 vol <= 2*VMA10
     N1 末段涨幅+踩20线          _scan_structure() 的 last5_gain / touched_ma20
-    N2 距平均成本5%~20%         _lookup_vwap() 的 120 日 VWAP 替代
+    N2 距平均成本5%~20%         _lookup_avg_cost() 的筹码分布（三角形分布法）
     S1 破20线清仓              decide_at_1455() 第一段
     S2 破5线减1/3              decide_at_1455() 第二段
     S3 巨量减1/3               decide_at_1455() 第三段
@@ -30,11 +30,14 @@
     突破仓                      _buy_scan() 记类型 + decide 里的分支
 
 三、与文档的差异（详见《520战法_聚宽版_说明.md》）
-    1. N2 的平均成本：聚宽没有筹码分布，用 120 日 VWAP 代替
+    1. N2 的平均成本：聚宽没有同花顺那套筹码分布数据，这里用三角形分布法自行推演筹码
+       分布再取加权均价（近似同花顺口径，详见说明文档 6.2）
     2. 次新：文档只说"剔除次新"，这里按上市满 3 年
     3. 只做主板（沪 600/601/603/605，深 000/001）
     4. 温和带量的 VMA5/VMA10 含当日累计量（同花顺口径），可关
     5. S4 用每分钟 last_price 采样 high/low，不用逐分钟 get_price
+    6. 卖出遇到跌停封死（order 未成交）→ 记入 p['pending']，下一个交易日 14:55 优先补卖；
+       补卖不占用当日信号名额，可与当天新触发的 S2/S3 叠加执行
 """
 
 import numpy as np
@@ -54,16 +57,25 @@ CFG = {
 
     # --- 指标窗口 ---
     'LOOKBACK': 60,             # 形态回溯天数（要够找金叉 G）
-    'VWAP_DAYS': 120,           # N2 用的 VWAP 窗口
+    'VWAP_DAYS': 120,           # 备用口径：VWAP 窗口
+    'COST_MODE': 'chip',        # 平均成本算法：'chip' = 筹码分布（同花顺近似）/ 'vwap' = 成交量加权均价
+    'COST_DAYS': 250,           # 筹码分布的回溯天数（约一年）
+    'COST_BINS': 200,           # 筹码分布的价格分档数
 
     # --- 阈值 ---
     'TOL_VOL': 0.9,             # 温和带量容差
     'BIG_VOL': 2.0,            # 巨量 = BIG_VOL × VMA10
-    'BUF': 1.01,                # 跌破缓冲：收盘 × 1.01 < 均线
+    'BUF': 1.01,                # 跌破缓冲：收盘 × 1.01 < 均线（只用于"下跌"）
+    'BUF_UP': 1.0,              # 站上缓冲（只用于"上涨"）：1.0 = 裸穿，收盘 > MA5 即算站上
     'N1_GAIN': 0.15,            # 末段 5 根涨幅否决线
-    'N2_LO': 0.05,              # 距 VWAP 下界
-    'N2_HI': 0.20,              # 距 VWAP 上界
+    'N2_LO': 0.05,              # 距平均成本下界
+    'N2_HI': 0.20,              # 距平均成本上界
     'S3_GAP': 1.05,             # 两次 S3 之间的最小涨幅
+    'CROSS_EXIT': True,         # MA5 < MA20（死叉，裸比较无缓冲）→ 清仓
+
+    # --- 大盘环境（总仓位上限，只限买入，不强制卖）---
+    'MARKET_ON': True,          # 总开关
+    'MARKET_INDEX': '000300.XSHG',   # 沪深 300
 
     # --- 费用（聚宽 OrderCost）---
     'COMMISSION': 0.00025,      # 佣金 万 2.5（双向）
@@ -99,6 +111,7 @@ def initialize(context):
     g.snap = {}     # code -> 形态快照（只存"昨天仍在回踩段里"的票）
     g.pos = {}      # code -> 仓位账本
     g.pool = []
+    g.market_ratio = 1.0    # 大盘环境给出的总仓位上限（每天 14:55 重算）
 
     run_daily(prepare_daily, '09:35')
     run_daily(check_s4, 'every_bar')
@@ -195,15 +208,16 @@ def _build_pool(context, today):
 def _scan_structure(c, v, m5, m20):
     """形态引擎。c/v/m5/m20 都是截止到"昨天"的数组。返回快照 dict 或 None。
 
-    只挑"昨天仍然收在 MA5 下方"的票——今天收盘站回 MA5 就是买点候选。
+    只挑"昨天仍然有效跌破 MA5（收盘 × 1.01 < MA5）"的票——今天收盘站回
+    MA5（收盘 > MA5，裸穿）就是买点候选。
     """
     n = len(c)
-    if not (c[-1] < m5[-1]):
+    if not (c[-1] * CFG['BUF'] < m5[-1]):
         return None
 
-    # --- R2：回踩段起点 S（往前扫，直到上一根还在 MA5 上方）---
+    # --- R2：回踩段起点 S（往前扫，直到上一根不再有效跌破 MA5）---
     i = n - 1
-    while i - 1 >= 0 and c[i - 1] < m5[i - 1]:
+    while i - 1 >= 0 and c[i - 1] * CFG['BUF'] < m5[i - 1]:
         i -= 1
     S = i
     if S <= 0:
@@ -264,6 +278,69 @@ def _today_ma(hist, price, dt_vol):
     return ma5, ma20, vma5, vma10
 
 
+# ==================== 大盘环境：总仓位上限 ====================
+
+def _index_now(context):
+    """14:55 时点的指数价：先试 get_current_data，再退到 1 分钟线，最后用昨收。"""
+    idx = CFG['MARKET_INDEX']
+    try:
+        d = get_current_data().get(idx)
+        if d is not None:
+            px = d.last_price
+            if px is not None and np.isfinite(px) and px > 0:
+                return float(px)
+    except Exception:
+        pass
+    try:
+        df = get_price(idx, end_date=context.current_dt, count=1,
+                       fields=['close'], frequency='1m', panel=False, fq=None)
+        if df is not None and len(df) > 0:
+            px = float(df['close'].values[-1])
+            if np.isfinite(px) and px > 0:
+                return px
+    except Exception:
+        pass
+    return None
+
+
+def _market_ratio(context):
+    """大盘环境 → 总仓位上限（0.25 / 0.50 / 0.75 / 1.00）。
+
+    判定顺序（裸值，不留缓冲）：
+      1. 指数收盘 < MA5                       → 25%
+      2. MA5 > MA20                            → 100%
+      3. 指数收盘 > MA20（但 MA5 <= MA20）     → 75%
+      4. 其余（MA5 <= MA20 且 收盘 <= MA20）   → 50%
+    只用来限制"买多少"，不触发任何卖出。
+    """
+    if not CFG['MARKET_ON']:
+        return 1.0
+    try:
+        prev = _prev_trade_day(context)
+        df = get_price(CFG['MARKET_INDEX'], end_date=prev, count=25,
+                       fields=['close'], frequency='daily', panel=False, fq=None)
+        if df is None or len(df) < 19:
+            return 1.0
+        c = np.asarray(df['close'].values, dtype=float)
+        px = _index_now(context)
+        if px is None:
+            px = float(c[-1])
+        ma5 = (float(np.nansum(c[-4:])) + px) / 5.0
+        ma20 = (float(np.nansum(c[-19:])) + px) / 20.0
+        if px < ma5:
+            r = 0.25
+        elif ma5 > ma20:
+            r = 1.00
+        elif px > ma20:
+            r = 0.75
+        else:
+            r = 0.50
+        return r
+    except Exception as e:
+        log.warn('[大盘环境] 判定失败，按 100%% 处理：%s' % e)
+        return 1.0
+
+
 # ==================== 盘中：S4 ====================
 
 def check_s4(context):
@@ -278,6 +355,8 @@ def check_s4(context):
     for code in list(context.portfolio.positions.keys()):
         p = g.pos.get(code)
         if p is None or p['type'] != '回踩' or p['touched']:
+            continue
+        if p.get('pending'):        # 已经在排队补卖，不再挂新的前高卖单
             continue
         if p['buy_date'] == today:          # T+1
             continue
@@ -308,6 +387,8 @@ def mark_s4_expired(context):
     for code in list(context.portfolio.positions.keys()):
         p = g.pos.get(code)
         if p is None or p['type'] != '回踩' or p['touched']:
+            continue
+        if p.get('pending'):        # 有补卖任务在排队，份额留给它
             continue
         if p.get('hi_date') != today:
             continue
@@ -343,11 +424,32 @@ def decide_at_1455(context):
             _cut(context, code, p, px, 'S1破20线', all_out=True)
             continue
 
+        # --- S1b：MA5 下穿 MA20（死叉）→ 清仓（裸值比较，不留缓冲）---
+        # 与 S1 并列最高优先级，谁先命中都一样是清仓，只影响日志里的原因。
+        if CFG['CROSS_EXIT'] and ma5_t < ma20_t:
+            _cut(context, code, p, px, 'S1b死叉', all_out=True)
+            continue
+
+        # --- 补卖：之前某天该卖（跌停卖不出）却没卖成的，今天 14:55 接着卖 ---
+        # 注意：补卖**不占用**今天的信号名额。补卖成交后，继续往下判断今天的
+        # 突破仓 / S2 / S3，两者可以在同一天各卖 1/3。
+        pend = p.get('pending')
+        if pend:
+            n = min(pend['shares'], p['left'])
+            filled = _cut(context, code, p, px, pend['reason'], shares=n)
+            if filled > 0:
+                if pend['reason'] == 'S3巨量':
+                    p['s3_last_close'] = px
+                elif pend['reason'] in ('S4摸前高', '突破仓止盈'):
+                    p['touched'] = True
+            if p['left'] <= 0:
+                continue
+
         # --- 突破仓：从 T+1 起，第一个"收盘 > 摊薄成本"的日子卖 1/3（替代 S4）---
         if p['type'] == '突破' and not p['touched'] and px > p['cost']:
-            _cut(context, code, p, px, '突破仓止盈')
-            p['touched'] = True
-            p['sold_today'] = today
+            if _cut(context, code, p, px, '突破仓止盈') > 0:
+                p['touched'] = True
+                p['sold_today'] = today
             continue
 
         # --- 浮盈前置：收盘 <= 摊薄成本 → S2/S3 不动 ---
@@ -358,20 +460,27 @@ def decide_at_1455(context):
         prev_close = hist['close'][-1]
         prev_ma5 = hist['ma5'][-1]
         if px * CFG['BUF'] < ma5_t and not (prev_close * CFG['BUF'] < prev_ma5):
-            _cut(context, code, p, px, 'S2破5线')
+            if _cut(context, code, p, px, 'S2破5线') > 0:
+                p['sold_today'] = today
             continue
 
         # --- S3：巨量日（最低优先级）---
         if dt_vol > CFG['BIG_VOL'] * vma10_t and p.get('sold_today') != today:
             last_s3 = p.get('s3_last_close')
             if last_s3 is None or px > last_s3 * CFG['S3_GAP']:
-                _cut(context, code, p, px, 'S3巨量')
-                p['s3_last_close'] = px
-                p['sold_today'] = today
+                if _cut(context, code, p, px, 'S3巨量') > 0:
+                    p['s3_last_close'] = px
+                    p['sold_today'] = today
 
     # ---------- 第二步：买入 ----------
     if len(context.portfolio.positions) >= CFG['MAX_HOLD']:
         return
+
+    # 大盘环境：算今天的总仓位上限（只影响买入，不影响已持仓）
+    g.market_ratio = _market_ratio(context)
+    if g.market_ratio < 1.0:
+        log.info('[大盘环境] 总仓位上限 %.0f%%' % (g.market_ratio * 100))
+
     if context.portfolio.available_cash <= 0:
         return
 
@@ -407,8 +516,8 @@ def _buy_scan(context, data, today):
         # --- R1 ---
         if ma5_t <= ma20_t:
             continue
-        # --- R4：收盘（14:55 价）站回 5 日线 ---
-        if px <= ma5_t:
+        # --- R4：收盘（14:55 价）站回 5 日线：收盘 > MA5（裸穿，不留缓冲）---
+        if px <= ma5_t * CFG['BUF_UP']:
             continue
         raw.append((code, st, hist, px, ma5_t, ma20_t, vma5_t, vma10_t))
 
@@ -440,9 +549,9 @@ def _buy_scan(context, data, today):
     if not out:
         return []
 
-    # --- N2：距 120 日 VWAP 5% ~ 20% ---
-    vwap = _lookup_vwap(context, [o['code'] for o in out])
-    out = [o for o in out if _n2_pass(vwap.get(o['code']), o['price'])]
+    # --- N2：距平均成本（筹码分布）5% ~ 20% ---
+    avg_cost = _lookup_avg_cost(context, [o['code'] for o in out])
+    out = [o for o in out if _n2_pass(avg_cost.get(o['code']), o['price'])]
     if not out:
         return []
 
@@ -453,7 +562,7 @@ def _buy_scan(context, data, today):
 
 
 def _lookup_vwap(context, codes):
-    """N2 的替代：用 120 日成交额加权均价 Σ(收盘×量)/Σ量 代替同花顺"平均成本"。"""
+    """备用口径：120 日成交量加权均价 Σ(收盘×量)/Σ量。"""
     prev = _prev_trade_day(context)
     df = get_price(codes, end_date=prev, count=CFG['VWAP_DAYS'],
                    fields=['close', 'volume'], fq='pre', frequency='daily',
@@ -467,6 +576,103 @@ def _lookup_vwap(context, codes):
         if vv > 0:
             res[code] = pv / vv
     return res
+
+
+# ---------- 平均成本：筹码分布（三角形分布法，逼近同花顺口径） ----------
+
+def _lookup_avg_cost(context, codes):
+    """N2 用的「平均成本」。默认按同花顺筹码分布的思路算，可切回 VWAP。"""
+    if CFG['COST_MODE'] != 'chip':
+        return _lookup_vwap(context, codes)
+    prev = _prev_trade_day(context)
+    df = get_price(codes, end_date=prev, count=CFG['COST_DAYS'],
+                   fields=['close', 'high', 'low', 'volume', 'money'],
+                   fq='pre', frequency='daily', panel=False)
+    if df is None or len(df) == 0:
+        return {}
+    caps = _circ_shares(context, codes)
+    res = {}
+    for code, sub in df.groupby('code'):
+        sh = caps.get(code)
+        if not sh:
+            continue
+        val = _chip_avg_cost(sub, sh)
+        if val:
+            res[code] = val
+    return res
+
+
+def _circ_shares(context, codes):
+    """流通股数（单位：股）。聚宽 circulating_cap 的单位是万股。"""
+    try:
+        q = query(valuation.code, valuation.circulating_cap).filter(
+            valuation.code.in_(codes))
+        df = get_fundamentals(q, date=context.previous_date)
+        return {r['code']: float(r['circulating_cap']) * 1e4
+                for _, r in df.iterrows() if r['circulating_cap']}
+    except Exception as e:
+        log.warn('流通股本取不到，N2 全部跳过：%s' % e)
+        return {}
+
+
+def _tri_weights(lo, hi, peak, edges):
+    """三角形分布：在 [lo, hi] 上以 peak 为峰，返回各价格档的权重（和 = 1）。"""
+    nb = len(edges) - 1
+    w = np.zeros(nb)
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+        k = int(np.clip(np.searchsorted(edges, lo) - 1, 0, nb - 1))
+        w[k] = 1.0
+        return w
+    peak = min(max(peak, lo), hi)
+    x = (edges[:-1] + edges[1:]) / 2.0
+    inside = (x >= lo) & (x <= hi)
+    left = inside & (x <= peak)
+    right = inside & (x > peak)
+    w[left] = (x[left] - lo) / (peak - lo) if peak > lo else 1.0
+    w[right] = (hi - x[right]) / (hi - peak) if hi > peak else 1.0
+    s = w.sum()
+    return w / s if s > 0 else w
+
+
+def _chip_avg_cost(sub, shares):
+    """三角形分布法推演筹码分布，返回筹码加权平均成本。
+
+    每一天：老筹码 × (1 − 换手率) + 当日新增筹码（在 [low, high] 上按三角分布，
+    峰值落在当日成交均价）。最后取筹码加权的价格均值。
+    """
+    h = np.asarray(sub['high'].values, dtype=float)
+    lo = np.asarray(sub['low'].values, dtype=float)
+    c = np.asarray(sub['close'].values, dtype=float)
+    v = np.asarray(sub['volume'].values, dtype=float)
+    m = np.asarray(sub['money'].values, dtype=float)
+
+    ok = np.isfinite(h) & np.isfinite(lo) & np.isfinite(c) & (h > 0) & (lo > 0)
+    if ok.sum() < 20:
+        return None
+    h, lo, c, v, m = h[ok], lo[ok], c[ok], v[ok], m[ok]
+
+    # 换手率（股数口径）；若聚宽 volume 单位是手，中位数会大 100 倍，自动纠正
+    tr = np.where(v > 0, v / float(shares), 0.0)
+    if float(np.median(tr)) > 0.5:
+        tr = tr / 100.0
+    tr = np.clip(tr, 0.0, 0.9)
+
+    lo_p, hi_p = float(np.nanmin(lo)), float(np.nanmax(h))
+    if not (hi_p > lo_p):
+        return None
+    pad = (hi_p - lo_p) * 0.02
+    edges = np.linspace(lo_p - pad, hi_p + pad, CFG['COST_BINS'] + 1)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+
+    chips = _tri_weights(lo[0], h[0], c[0], edges)      # 起点：筹码全在第一天区间
+    for i in range(1, len(c)):
+        avg = m[i] / v[i] if v[i] > 0 else c[i]         # 当日成交均价
+        chips = chips * (1.0 - tr[i]) + tr[i] * _tri_weights(lo[i], h[i], avg, edges)
+
+    s = chips.sum()
+    if s <= 0:
+        return None
+    return float((chips * centers).sum() / s)
 
 
 def _n2_pass(vwap, px):
@@ -489,16 +695,32 @@ def _cut_shares(p):
     return max(0, min(q, left))
 
 
-def _cut(context, code, p, px, reason, all_out=False):
-    shares = p['left'] if all_out else _cut_shares(p)
+def _cut(context, code, p, px, reason, all_out=False, shares=None):
+    """卖出一刀。成交不了（跌停封死 / 停牌 / 无买盘）就挂进 p['pending']，
+    由下一个交易日的 14:55 优先补卖，直到卖掉为止。"""
+    if shares is None:
+        shares = p['left'] if all_out else _cut_shares(p)
+    shares = min(int(shares), int(p['left']))
     if shares <= 0:
         _forget_if_empty(code, p)
         return 0
 
+    today = context.current_dt.date()
     rec = order(code, -shares)
     filled = int(rec.filled) if rec is not None and rec.filled else 0
+
     if filled <= 0:
+        # 一笔没成交：记下来，明天 14:55 继续卖
+        prev = p.get('pending')
+        if prev is not None and prev['reason'] == reason:
+            prev['shares'] = max(prev['shares'], shares)   # 同一信号重复触发，取大的
+        else:
+            p['pending'] = dict(shares=shares, reason=reason, since=today)
+        log.warn('[%s] %s 想卖 %d 股（%s）没成交，挂到下一个 14:55 补卖' % (
+            today, code, shares, reason))
         return 0
+
+    p['pending'] = None
     deal = float(rec.price) if rec is not None and rec.price else px
 
     p['proceeds'] += deal * filled
@@ -506,6 +728,8 @@ def _cut(context, code, p, px, reason, all_out=False):
     p['cuts'] += 1
     if p['left'] > 0:
         p['cost'] = (p['amount'] - p['proceeds']) / p['left']
+        if filled < shares:                                # 部分成交，余量继续挂
+            p['pending'] = dict(shares=shares - filled, reason=reason, since=today)
     else:
         log.info('[%s] %s 清仓（%s），共 %d 刀' % (
             context.current_dt.date(), code, reason, p['cuts']))
@@ -520,7 +744,15 @@ def _buy(context, item):
         return
     cash = context.portfolio.available_cash
     tv = context.portfolio.total_value
-    budget = min(CFG['MAX_WEIGHT'] * tv, cash / slots)
+
+    # 大盘环境：剩余可投额度 = 总资产 × 仓位上限 − 已持仓市值
+    ratio = g.market_ratio if g.market_ratio is not None else 1.0
+    held_value = max(0.0, tv - cash)          # 近似持仓市值
+    quota = tv * ratio - held_value
+    if quota <= 0:
+        return                                  # 额度用尽：不买，但也不卖
+
+    budget = min(CFG['MAX_WEIGHT'] * tv, quota / slots, cash / slots)
     shares = int(budget / px / 100.0) * 100
     if shares < 100:
         return
@@ -539,6 +771,7 @@ def _buy(context, item):
         buy_date=context.current_dt.date(),
         sold_today=None, s3_last_close=None,
         hi_date=None, day_hi=None, day_lo=None,
+        pending=None,
     )
     log.info('[%s] 买入 %s %d 股 @ %.2f（%s，前高 %.2f）' % (
         context.current_dt.date(), code, filled, deal, item['type'], item['H']))
